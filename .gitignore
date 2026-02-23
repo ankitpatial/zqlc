@@ -1,0 +1,5 @@
+.zig-cache
+.claude
+.env
+zig-out
+src/example/dest
