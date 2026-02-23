@@ -1,63 +1,108 @@
 # zqlc
 
-Type-safe SQL code generation for Zig. Reads `.sql` files, introspects a live PostgreSQL database, and generates Zig structs and query functions.
+Type-safe SQL code generation for Zig — like [sqlc](https://sqlc.dev), but for Zig.
 
-## How it works
-
-1. Discovers `.sql` files in `src/**/sql/` directories
-2. Parses SQL annotations (`-- name: QueryName :kind`)
-3. Connects to PostgreSQL and introspects parameter/column types
-4. Generates a `sql.zig` file in the parent directory of each `sql/` folder
+Reads `.sql` files, introspects a live PostgreSQL database, and generates Zig structs and query functions.
 
 ## Requirements
 
 - Zig 0.15+
 - A running PostgreSQL database
 
-## Build
+## Install
 
 ```sh
-zig build
+git clone https://github.com/ankitpatial/zqlc.git
+cd zqlc
+zig build -Doptimize=.ReleaseSafe
+# copy zig-out/bin/zqlc somewhere on your PATH
 ```
 
-## Usage
+## Quick start
 
-Set `DATABASE_URL` as an environment variable or in a `.env` file:
+**1. Set your database connection**
 
 ```sh
-# Environment variable
-DATABASE_URL=postgresql://user:password@localhost:5432/mydb zqlc generate
+export DATABASE_URL=postgresql://user:password@localhost:5432/mydb
+```
 
-# Or create a .env file in the project root
-echo 'DATABASE_URL=postgresql://user:password@localhost:5432/mydb' > .env
-zqlc generate
+Or create a `.env` file in your project root:
+
+```
+DATABASE_URL=postgresql://user:password@localhost:5432/mydb
+```
+
+**2. Write a SQL file**
+
+Place it inside a `db/sql/` subdirectory:
+
+```sql
+-- db/sql/user.sql
+
+-- name: FindById :one
+SELECT id, name, email
+FROM users
+WHERE id = $1;
+```
+
+**3. Generate**
+
+```sh
+zqlc generate --src db/sql/ --dest db/query/
+```
+
+This produces `db/query/user.zig` with type-safe structs and functions.
+
+**4. Use the generated code**
+
+```zig
+const query = @import("db/query/root.zig");
+
+pub fn handler(pool: *pg.Pool, allocator: std.mem.Allocator) !void {
+    if (try query.user.findById(pool, allocator, 42)) |user| {
+        std.debug.print("Found: {s}\n", .{user.name});
+    }
+}
+```
+
+## CLI reference
+
+```
+zqlc <command> --src <dir> --dest <dir>
 ```
 
 ### Commands
 
-| Command | Description |
-|---------|-------------|
-| `generate` | Generate Zig code from SQL files (default) |
-| `check` | Check if generated files are up to date |
+| Command    | Description                                  |
+|------------|----------------------------------------------|
+| `generate` | Generate Zig code from SQL files             |
+| `check`    | Check if generated files are up to date      |
 
 ### Options
 
-| Option | Description |
-|--------|-------------|
-| `--src <dir>` | Directory to scan for `sql/` subdirectories (default: `{project_root}/src`) |
-| `--dest <dir>` | Output directory for generated files (mirrors `--src` structure) |
-| `-h`, `--help` | Show help message |
-| `-v`, `--version` | Show version |
+| Option         | Description                                                              |
+|----------------|--------------------------------------------------------------------------|
+| `--src <dir>`  | **(required)** Directory containing `.sql` files                         |
+| `--dest <dir>` | **(required)** Output directory for generated files                      |
+| `-h, --help`   | Show help                                                                |
+| `-v, --version`| Show version                                                             |
 
-When `--dest` is set, the directory structure from `--src` is mirrored into `--dest`, and two additional files are generated:
+### Examples
+
+```sh
+# Generate Zig code
+zqlc generate --src db/sql/ --dest db/query/
+
+# CI: fail if generated code is stale
+zqlc check --src db/sql/ --dest db/query/
+```
+
+### Output
+
+The directory structure from `--src` is mirrored into `--dest`, and two additional files are generated:
 
 - **`root.zig`** — re-exports all generated `sql.zig` modules
 - **`helper.zig`** — shared type definitions (e.g., `Timestamp`, PG enum types)
-
-```sh
-# Scan queries/ for SQL, output generated Zig to src/db/
-zqlc --src queries/ --dest src/db/ generate
-```
 
 ```
 queries/                  src/db/
@@ -67,47 +112,25 @@ queries/                  src/db/
     create_post.sql         helper.zig
 ```
 
-### Check mode
-
-Use `check` in CI to detect drift between SQL files and generated code:
-
-```sh
-zqlc check
-```
-
-Exits with code 1 if any `sql.zig` file is out of date.
-
 ## SQL annotations
 
-Annotate your SQL files with `-- name: QueryName :kind`:
+Each SQL file must have an annotation comment on the line before the query:
 
-| Kind | Return type | Description |
-|------|-------------|-------------|
-| `:one` | `?Row` | Returns one row or null |
-| `:many` | `[]Row` | Returns zero or more rows |
-| `:exec` | `void` | Execute, no return value |
-| `:execrows` | `?usize` | Returns affected row count |
-
-## Directory convention
-
-```
-src/
-  users/
-    sql/
-      find_user.sql
-      list_users.sql
-    sql.zig          <-- generated
-  posts/
-    sql/
-      create_post.sql
-    sql.zig          <-- generated
+```sql
+-- name: QueryName :kind
 ```
 
-Each `sql/` directory produces one `sql.zig` in its parent directory.
+| Kind        | Return type | Description                  |
+|-------------|-------------|------------------------------|
+| `:one`      | `?Row`      | Returns one row or null      |
+| `:many`     | `[]Row`     | Returns zero or more rows    |
+| `:exec`     | `void`      | Execute, no return value     |
+| `:execrows` | `?usize`    | Returns affected row count   |
 
-## Example
 
-### SQL file (`src/users/sql/find_user.sql`)
+## Generated code example
+
+Given this SQL:
 
 ```sql
 -- name: FindUserById :one
@@ -116,7 +139,7 @@ FROM users
 WHERE id = $1;
 ```
 
-### Generated Zig (`src/users/sql.zig`)
+`zqlc` generates:
 
 ```zig
 // Code generated by zqlc. DO NOT EDIT.
@@ -147,21 +170,9 @@ pub fn findUserById(pool: *pg.Pool, allocator: std.mem.Allocator, id: i32) !?Fin
 }
 ```
 
-### Using the generated code
+### Params struct
 
-```zig
-const sql = @import("sql.zig");
-
-pub fn handler(pool: *pg.Pool, allocator: std.mem.Allocator) !void {
-    if (try sql.findUserById(pool, allocator, 42)) |user| {
-        std.debug.print("Found: {s}\n", .{user.name});
-    }
-}
-```
-
-## Params struct
-
-When a query has 4 or more parameters, a `Params` struct is generated:
+When a query has 4 or more parameters, a `Params` struct is generated instead of positional arguments:
 
 ```sql
 -- name: UpdateUser :one
@@ -169,8 +180,6 @@ UPDATE users SET name = $2, email = $3, is_active = $4
 WHERE id = $1
 RETURNING id, name, email;
 ```
-
-Generates:
 
 ```zig
 pub const UpdateUserParams = struct {
@@ -187,21 +196,21 @@ pub fn updateUser(pool: *pg.Pool, allocator: std.mem.Allocator, params: UpdateUs
 
 ## Type mappings
 
-| PostgreSQL | Zig |
-|------------|-----|
-| `boolean` | `bool` |
-| `smallint` | `i16` |
-| `integer` | `i32` |
-| `bigint` | `i64` |
-| `real` | `f32` |
-| `double precision`, `numeric` | `f64` |
-| `text`, `varchar` | `[]const u8` |
-| `bytea` | `[]const u8` |
-| `uuid` | `[]const u8` |
-| `json`, `jsonb` | `[]const u8` |
-| `timestamp`, `timestamptz` | `i64` |
-| `date` | `i32` |
-| `time`, `timetz` | `i64` |
-| `interval` | `[]const u8` |
+| PostgreSQL                     | Zig            |
+|--------------------------------|----------------|
+| `boolean`                      | `bool`         |
+| `smallint`                     | `i16`          |
+| `integer`                      | `i32`          |
+| `bigint`                       | `i64`          |
+| `real`                         | `f32`          |
+| `double precision`, `numeric`  | `f64`          |
+| `text`, `varchar`              | `[]const u8`   |
+| `bytea`                        | `[]const u8`   |
+| `uuid`                         | `[]const u8`   |
+| `json`, `jsonb`                | `[]const u8`   |
+| `timestamp`, `timestamptz`     | `i64`          |
+| `date`                         | `i32`          |
+| `time`, `timetz`               | `i64`          |
+| `interval`                     | `[]const u8`   |
 
 Nullable columns are wrapped with `?` (e.g., `?i32`, `?[]const u8`).

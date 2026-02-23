@@ -9,7 +9,7 @@ const Mode = enum {
 };
 
 const Config = struct {
-    mode: Mode = .generate,
+    mode: ?Mode = null,
     host: []const u8 = "localhost",
     port: u16 = 5432,
     user: []const u8 = "",
@@ -76,6 +76,26 @@ pub fn main() !void {
         }
     }
 
+    // Validate required arguments
+    if (config.src_dir == null) {
+        try stderr.writeAll("Missing required option: --src <dir>\n\n");
+        try printUsage(stderr);
+        try stderr.flush();
+        std.process.exit(1);
+    }
+    if (config.dest_dir == null) {
+        try stderr.writeAll("Missing required option: --dest <dir>\n\n");
+        try printUsage(stderr);
+        try stderr.flush();
+        std.process.exit(1);
+    }
+    if (config.mode == null) {
+        try stderr.writeAll("Missing required command: generate or check\n\n");
+        try printUsage(stderr);
+        try stderr.flush();
+        std.process.exit(1);
+    }
+
     // Read database connection config from environment
     var env = std.process.getEnvMap(allocator) catch |err| {
         try stderr.print("Failed to read environment: {}\n", .{err});
@@ -102,8 +122,8 @@ pub fn main() !void {
 
     // Resolve src_dir to absolute path
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const src_dir: []const u8 = if (config.src_dir) |sd| blk: {
-        const abs = std.fs.cwd().realpath(sd, &path_buf) catch {
+    const src_dir: []const u8 = blk: {
+        const abs = std.fs.cwd().realpath(config.src_dir.?, &path_buf) catch {
             const e = lib.errors.Error{ .config = .{
                 .message = "Could not resolve --src directory path.",
             } };
@@ -112,24 +132,18 @@ pub fn main() !void {
             std.process.exit(1);
         };
         break :blk try allocator.dupe(u8, abs);
-    } else blk: {
-        const project_root = lib.project.findProjectRoot(allocator) catch {
-            const e = lib.errors.Error{ .config = .{
-                .message = "Could not find project root (no build.zig.zon found in parent directories).",
-            } };
-            try e.format(stderr, use_color);
-            try stderr.flush();
-            std.process.exit(1);
-        };
-        defer allocator.free(project_root);
-        break :blk try std.fs.path.join(allocator, &.{ project_root, "src" });
     };
     defer allocator.free(src_dir);
 
-    // Resolve dest_dir to absolute path if provided, creating it if needed
+    // In generate mode, clean dest_dir to remove stale files
+    if (config.mode.? == .generate) {
+        std.fs.cwd().deleteTree(config.dest_dir.?) catch {};
+    }
+
+    // Resolve dest_dir to absolute path, creating it if needed
     var dest_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dest_dir: ?[]const u8 = if (config.dest_dir) |dd| blk: {
-        std.fs.cwd().makePath(dd) catch {
+    const dest_dir: []const u8 = blk: {
+        std.fs.cwd().makePath(config.dest_dir.?) catch {
             const e = lib.errors.Error{ .config = .{
                 .message = "Could not create --dest directory.",
             } };
@@ -137,7 +151,7 @@ pub fn main() !void {
             try stderr.flush();
             std.process.exit(1);
         };
-        const abs = std.fs.cwd().realpath(dd, &dest_path_buf) catch {
+        const abs = std.fs.cwd().realpath(config.dest_dir.?, &dest_path_buf) catch {
             const e = lib.errors.Error{ .config = .{
                 .message = "Could not resolve --dest directory path.",
             } };
@@ -146,8 +160,8 @@ pub fn main() !void {
             std.process.exit(1);
         };
         break :blk try allocator.dupe(u8, abs);
-    } else null;
-    defer if (dest_dir) |dd| allocator.free(dd);
+    };
+    defer allocator.free(dest_dir);
 
     // Discover SQL files
     if (use_color) try stderr.writeAll("\x1b[36m");
@@ -155,7 +169,7 @@ pub fn main() !void {
     if (use_color) try stderr.writeAll("\x1b[0m");
     try stderr.flush();
 
-    var groups = lib.project.discoverSqlFiles(allocator, src_dir, dest_dir, config.src_dir != null) catch {
+    var groups = lib.project.discoverSqlFiles(allocator, src_dir, dest_dir, true) catch {
         const e = lib.errors.Error{ .file = .{
             .path = src_dir,
             .message = "Failed to scan for SQL files.",
@@ -214,7 +228,7 @@ pub fn main() !void {
     try stderr.flush();
 
     var error_count: usize = 0;
-    const output_base = dest_dir orelse src_dir;
+    const output_base = dest_dir;
 
     // Collect typed query slices for helper.zig generation (when dest_dir is set)
     var all_typed_query_slices: std.ArrayList([]const lib.introspect.TypedQuery) = .empty;
@@ -270,8 +284,8 @@ pub fn main() !void {
             continue;
         };
 
-        // Compute helper_rel_path when dest_dir is set
-        const helper_rel_path: ?[]const u8 = if (dest_dir != null) blk: {
+        // Compute helper_rel_path
+        const helper_rel_path: []const u8 = blk: {
             // rel_path is e.g. "users/sql.zig", we need relative path from that dir to helper.zig
             const rel_dir = std.fs.path.dirname(group.rel_path) orelse ".";
             // Count depth to compute "../" prefix
@@ -288,10 +302,8 @@ pub fn main() !void {
                 try rel_buf.appendSlice(allocator, "helper.zig");
                 break :blk try rel_buf.toOwnedSlice(allocator);
             }
-        } else null;
-        defer if (helper_rel_path) |hrp| {
-            if (!std.mem.eql(u8, hrp, "helper.zig")) allocator.free(hrp);
         };
+        defer if (!std.mem.eql(u8, helper_rel_path, "helper.zig")) allocator.free(helper_rel_path);
 
         // Generate Zig code
         const generated = lib.codegen.generate(allocator, typed_queries.items, helper_rel_path) catch |err| {
@@ -309,18 +321,12 @@ pub fn main() !void {
         defer allocator.free(generated);
 
         // Store typed queries for helper generation
-        if (dest_dir != null) {
-            try all_typed_query_slices.append(allocator, typed_queries.items);
-            try all_typed_queries.append(allocator, typed_queries);
-        } else {
-            // When no dest_dir, free typed queries after this iteration
-            for (typed_queries.items) |*tq| tq.deinit(allocator);
-            typed_queries.deinit(allocator);
-        }
+        try all_typed_query_slices.append(allocator, typed_queries.items);
+        try all_typed_queries.append(allocator, typed_queries);
 
         const output_filename = std.fs.path.basename(group.output_path);
 
-        switch (config.mode) {
+        switch (config.mode.?) {
             .generate => {
                 // Ensure output directory exists (mkpath for nested dirs)
                 std.fs.cwd().makePath(group.parent_dir) catch {
@@ -400,8 +406,8 @@ pub fn main() !void {
         }
     }
 
-    // Generate helper.zig and root.zig when dest_dir is set
-    if (dest_dir != null and error_count == 0) {
+    // Generate helper.zig and root.zig
+    if (error_count == 0) {
         const helper_content = lib.codegen.generateHelper(allocator, all_typed_query_slices.items) catch |err| {
             const e = lib.errors.Error{ .query_error = .{
                 .file_path = "helper.zig",
@@ -426,7 +432,7 @@ pub fn main() !void {
         };
         defer allocator.free(root_content);
 
-        switch (config.mode) {
+        switch (config.mode.?) {
             .generate => {
                 try writeOutputFile(allocator, output_base, "helper.zig", helper_content, stderr, use_color, &error_count);
                 try writeOutputFile(allocator, output_base, "root.zig", root_content, stderr, use_color, &error_count);
@@ -449,7 +455,7 @@ pub fn main() !void {
     }
 
     if (use_color) try stderr.writeAll("\x1b[32m");
-    switch (config.mode) {
+    switch (config.mode.?) {
         .generate => try stderr.writeAll("Done.\n"),
         .check => try stderr.writeAll("All files up to date.\n"),
     }
@@ -612,15 +618,15 @@ fn printUsage(w: *std.Io.Writer) !void {
     try w.writeAll(
         \\zqlc - Type-safe SQL code generation for Zig
         \\
-        \\Usage: zqlc [command] [options]
+        \\Usage: zqlc <command> --src <dir> --dest <dir>
         \\
         \\Commands:
-        \\  generate    Generate Zig code from SQL files (default)
+        \\  generate    Generate Zig code from SQL files
         \\  check       Check if generated files are up to date
         \\
         \\Options:
-        \\  --src <dir>    Directory to scan for sql/ subdirectories (default: {project_root}/src)
-        \\  --dest <dir>   Output directory for generated files (mirrors --src structure)
+        \\  --src <dir>    Directory containing .sql files (required)
+        \\  --dest <dir>   Output directory for generated files (required)
         \\  -h, --help     Show this help message
         \\  -v, --version  Show version
         \\
@@ -630,9 +636,8 @@ fn printUsage(w: *std.Io.Writer) !void {
         \\
         \\  Can also be set in a .env file in the project root.
         \\
-        \\SQL files are discovered in **/sql/ directories under the source directory.
-        \\Each sql/ directory produces one sql.zig file in its parent directory.
-        \\When --dest is set, root.zig and helper.zig are also generated.
+        \\Example:
+        \\  zqlc generate --src db/sql/ --dest db/query/
         \\
     );
 }
