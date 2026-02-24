@@ -109,3 +109,97 @@ test "buildDownloadUrl with different tags" {
     defer allocator.free(url2);
     try std.testing.expect(std.mem.indexOf(u8, url2, "/v0.1.0-beta/") != null);
 }
+
+/// Shells out to curl to fetch the latest release tag from GitHub.
+/// Returns the tag name string (e.g. "v0.2.0"). Caller owns the returned memory.
+pub fn fetchLatestTag(allocator: std.mem.Allocator) ![]const u8 {
+    const result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{
+            "curl",
+            "-sfL",
+            "-H",
+            "Accept: application/vnd.github.v3+json",
+            "https://api.github.com/repos/" ++ repo ++ "/releases/latest",
+        },
+    }) catch {
+        return error.CurlFailed;
+    };
+    defer allocator.free(result.stderr);
+    defer allocator.free(result.stdout);
+
+    switch (result.term) {
+        .Exited => |code| {
+            if (code != 0) return error.CurlFailed;
+        },
+        else => return error.CurlFailed,
+    }
+
+    return parseTagName(allocator, result.stdout);
+}
+
+/// Extracts the "tag_name" value from a GitHub API JSON response
+/// using simple string searching. Caller owns the returned memory.
+fn parseTagName(allocator: std.mem.Allocator, json: []const u8) ![]const u8 {
+    const key = "\"tag_name\"";
+
+    // Find the key in the JSON string
+    const key_pos = std.mem.indexOf(u8, json, key) orelse return error.VersionParseFailed;
+
+    // Move past the key
+    var pos = key_pos + key.len;
+
+    // Skip whitespace
+    while (pos < json.len and (json[pos] == ' ' or json[pos] == '\t' or json[pos] == '\n' or json[pos] == '\r')) {
+        pos += 1;
+    }
+
+    // Expect a colon
+    if (pos >= json.len or json[pos] != ':') return error.VersionParseFailed;
+    pos += 1;
+
+    // Skip whitespace after colon
+    while (pos < json.len and (json[pos] == ' ' or json[pos] == '\t' or json[pos] == '\n' or json[pos] == '\r')) {
+        pos += 1;
+    }
+
+    // Expect opening quote
+    if (pos >= json.len or json[pos] != '"') return error.VersionParseFailed;
+    pos += 1;
+
+    // Find closing quote
+    const value_start = pos;
+    while (pos < json.len and json[pos] != '"') {
+        pos += 1;
+    }
+    if (pos >= json.len) return error.VersionParseFailed;
+
+    const value = json[value_start..pos];
+    return allocator.dupe(u8, value);
+}
+
+test "parseTagName extracts tag from normal JSON" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"tag_name": "v0.2.0", "name": "Release v0.2.0"}
+    ;
+    const tag = try parseTagName(allocator, json);
+    defer allocator.free(tag);
+    try std.testing.expectEqualStrings("v0.2.0", tag);
+}
+
+test "parseTagName handles whitespace variations" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{ "tag_name" : "v1.0.0" }
+    ;
+    const tag = try parseTagName(allocator, json);
+    defer allocator.free(tag);
+    try std.testing.expectEqualStrings("v1.0.0", tag);
+}
+
+test "parseTagName returns error for missing key" {
+    const allocator = std.testing.allocator;
+    const result = parseTagName(allocator, "{}");
+    try std.testing.expectError(error.VersionParseFailed, result);
+}
