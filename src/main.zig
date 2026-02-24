@@ -1,11 +1,13 @@
 const std = @import("std");
 const lib = @import("zqlc");
 
-const version = lib.update.version;
+const update = lib.update;
+const version = update.version;
 
 const Mode = enum {
     generate,
     check,
+    update,
 };
 
 const Config = struct {
@@ -68,6 +70,8 @@ pub fn main() !void {
             config.mode = .check;
         } else if (std.mem.eql(u8, arg, "generate")) {
             config.mode = .generate;
+        } else if (std.mem.eql(u8, arg, "update")) {
+            config.mode = .update;
         } else {
             try stderr.print("Unknown argument: {s}\n\n", .{arg});
             try printUsage(stderr);
@@ -76,7 +80,24 @@ pub fn main() !void {
         }
     }
 
-    // Validate required arguments
+    // Validate mode
+    if (config.mode == null) {
+        try stderr.writeAll("Missing required command: generate, check, or update\n\n");
+        try printUsage(stderr);
+        try stderr.flush();
+        std.process.exit(1);
+    }
+
+    // Handle update mode — doesn't need database or src/dest
+    if (config.mode.? == .update) {
+        _ = update.run(allocator, stderr, use_color) catch |err| switch (err) {
+            error.AlreadyUpToDate => return,
+            else => std.process.exit(1),
+        };
+        return;
+    }
+
+    // Validate required arguments for generate/check
     if (config.src_dir == null) {
         try stderr.writeAll("Missing required option: --src <dir>\n\n");
         try printUsage(stderr);
@@ -85,12 +106,6 @@ pub fn main() !void {
     }
     if (config.dest_dir == null) {
         try stderr.writeAll("Missing required option: --dest <dir>\n\n");
-        try printUsage(stderr);
-        try stderr.flush();
-        std.process.exit(1);
-    }
-    if (config.mode == null) {
-        try stderr.writeAll("Missing required command: generate or check\n\n");
         try printUsage(stderr);
         try stderr.flush();
         std.process.exit(1);
@@ -411,6 +426,7 @@ pub fn main() !void {
                     try stderr.flush();
                 }
             },
+            .update => unreachable,
         }
     }
 
@@ -449,6 +465,7 @@ pub fn main() !void {
                 try checkOutputFile(allocator, output_base, "helper.zig", helper_content, stderr, use_color, &error_count);
                 try checkOutputFile(allocator, output_base, "root.zig", root_content, stderr, use_color, &error_count);
             },
+            .update => unreachable,
         }
     }
 
@@ -466,6 +483,7 @@ pub fn main() !void {
     switch (config.mode.?) {
         .generate => try stderr.writeAll("Done.\n"),
         .check => try stderr.writeAll("All files up to date.\n"),
+        .update => unreachable,
     }
     if (use_color) try stderr.writeAll("\x1b[0m");
     try stderr.flush();
@@ -631,6 +649,7 @@ fn printUsage(w: *std.Io.Writer) !void {
         \\Commands:
         \\  generate    Generate Zig code from SQL files
         \\  check       Check if generated files are up to date
+        \\  update      Update zqlc to the latest version
         \\
         \\Options:
         \\  --src <dir>    Directory containing .sql files (required)
