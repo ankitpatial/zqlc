@@ -2,7 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 /// Single source of truth for the zqlc version.
-pub const version = "0.1.0";
+pub const version = "0.2.1";
 
 /// GitHub repository path.
 const repo = "ankitpatial/zqlc";
