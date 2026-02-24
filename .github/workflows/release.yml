@@ -1,0 +1,79 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.15.2"
+
+      - name: Run tests
+        run: zig build test
+
+      - name: Validate version tag
+        run: |
+          # Extract version from src/update.zig
+          SOURCE_VERSION=$(grep -oP 'pub const version = "\K[^"]+' src/update.zig)
+          # Extract version from git tag (strip leading 'v')
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+
+          echo "Source version: $SOURCE_VERSION"
+          echo "Tag version:    $TAG_VERSION"
+
+          if [ "$SOURCE_VERSION" != "$TAG_VERSION" ]; then
+            echo "::error::Version mismatch: src/update.zig has '$SOURCE_VERSION' but tag is '$TAG_VERSION'"
+            exit 1
+          fi
+
+      - name: Build and package all targets
+        run: |
+          mkdir -p dist
+
+          targets=(
+            "x86_64-linux"
+            "aarch64-linux"
+            "x86_64-macos"
+            "aarch64-macos"
+            "x86_64-windows"
+            "aarch64-windows"
+          )
+
+          for triple in "${targets[@]}"; do
+            echo "==> Building for $triple"
+            zig build -Dtarget="$triple" -Doptimize=.ReleaseSafe
+
+            case "$triple" in
+              *-windows)
+                archive="zqlc-${triple#*-}-${triple%%-*}.zip"
+                (cd zig-out/bin && zip "../../dist/$archive" zqlc.exe)
+                ;;
+              *)
+                archive="zqlc-${triple#*-}-${triple%%-*}.tar.gz"
+                tar -czf "dist/$archive" -C zig-out/bin zqlc
+                ;;
+            esac
+
+            echo "    Packaged dist/$archive"
+          done
+
+          echo "==> All archives:"
+          ls -lh dist/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: dist/*
