@@ -1,7 +1,7 @@
 const std = @import("std");
 const lib = @import("zqlc");
 
-const version = "0.1.0";
+const version = lib.update.version;
 
 const Mode = enum {
     generate,

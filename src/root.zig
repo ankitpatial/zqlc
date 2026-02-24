@@ -12,6 +12,7 @@ pub const query = @import("query.zig");
 pub const project = @import("project.zig");
 pub const codegen = @import("codegen.zig");
 pub const errors = @import("errors.zig");
+pub const update = @import("update.zig");
 
 test {
     const std = @import("std");
