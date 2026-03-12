@@ -23,17 +23,17 @@ pub const SqlFileGroup = struct {
 };
 
 /// Find the project root by walking upward from CWD looking for build.zig.zon.
-pub fn findProjectRoot(allocator: std.mem.Allocator) ![]const u8 {
+pub fn findProjectRoot(allocator: std.mem.Allocator, io: std.Io) ![]const u8 {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const realpath = try std.fs.cwd().realpath(".", &path_buf);
-    var current: []const u8 = realpath;
+    const len = try std.Io.Dir.cwd().realPath(io, &path_buf);
+    var current: []const u8 = path_buf[0..len];
 
     while (true) {
         // Check if build.zig.zon exists in current directory
-        var dir = std.fs.openDirAbsolute(current, .{}) catch return error.NotFound;
-        defer dir.close();
+        var dir = std.Io.Dir.openDirAbsolute(io, current, .{}) catch return error.NotFound;
+        defer dir.close(io);
 
-        dir.access("build.zig.zon", .{}) catch {
+        dir.access(io, "build.zig.zon", .{}) catch {
             // Go to parent
             const parent = std.fs.path.dirname(current);
             if (parent == null or std.mem.eql(u8, parent.?, current)) {
@@ -53,17 +53,17 @@ pub fn findProjectRoot(allocator: std.mem.Allocator) ![]const u8 {
 ///   When null, output files are placed next to each sql/ directory (legacy behavior).
 /// - explicit_src: when true, scans for **/*.sql and groups by parent dir.
 ///   When false, uses legacy convention: only files inside sql/ subdirectories.
-pub fn discoverSqlFiles(allocator: std.mem.Allocator, src_dir: []const u8, dest_dir: ?[]const u8, explicit_src: bool) !std.ArrayList(SqlFileGroup) {
+pub fn discoverSqlFiles(allocator: std.mem.Allocator, io: std.Io, src_dir: []const u8, dest_dir: ?[]const u8, explicit_src: bool) !std.ArrayList(SqlFileGroup) {
     var groups: std.ArrayList(SqlFileGroup) = .empty;
     errdefer {
         for (groups.items) |*g| g.deinit(allocator);
         groups.deinit(allocator);
     }
 
-    var dir = std.fs.openDirAbsolute(src_dir, .{ .iterate = true }) catch {
+    var dir = std.Io.Dir.openDirAbsolute(io, src_dir, .{ .iterate = true }) catch {
         return groups; // Directory doesn't exist — return empty
     };
-    defer dir.close();
+    defer dir.close(io);
 
     // Walk the directory tree
     var walker = try dir.walk(allocator);
@@ -81,7 +81,7 @@ pub fn discoverSqlFiles(allocator: std.mem.Allocator, src_dir: []const u8, dest_
         sql_dirs.deinit();
     }
 
-    while (walker.next() catch null) |entry| {
+    while (walker.next(io) catch null) |entry| {
         if (entry.kind != .file) continue;
 
         const path = entry.path;
@@ -186,7 +186,7 @@ fn sortStrings(_: void, a: []const u8, b: []const u8) bool {
 
 test "findProjectRoot from project dir" {
     const allocator = std.testing.allocator;
-    const root = findProjectRoot(allocator) catch {
+    const root = findProjectRoot(allocator, std.testing.io) catch {
         return;
     };
     defer allocator.free(root);

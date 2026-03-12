@@ -21,28 +21,24 @@ const Config = struct {
     dest_dir: ?[]const u8 = null,
 };
 
-pub fn main() !void {
-    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
-    defer _ = gpa.deinit();
-    var arena = std.heap.ArenaAllocator.init(gpa.allocator());
-    defer arena.deinit();
-    const allocator = arena.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.arena.allocator();
+    const io = init.io;
 
     var stderr_buf: [4096]u8 = undefined;
-    var stderr_w = std.fs.File.stderr().writer(&stderr_buf);
+    var stderr_w = std.Io.File.stderr().writer(io, &stderr_buf);
     const stderr = &stderr_w.interface;
 
     var stdout_buf: [4096]u8 = undefined;
-    var stdout_w = std.fs.File.stdout().writer(&stdout_buf);
+    var stdout_w = std.Io.File.stdout().writer(io, &stdout_buf);
     const stdout = &stdout_w.interface;
 
-    const use_color = lib.errors.isTty(std.fs.File.stderr().handle);
+    const use_color = lib.errors.isTty(std.Io.File.stderr(), io);
 
     var config = Config{};
 
     // Parse CLI args
-    var args = try std.process.argsWithAllocator(allocator);
-    defer args.deinit();
+    var args = init.minimal.args.iterate();
     _ = args.next(); // skip program name
 
     while (args.next()) |arg| {
@@ -90,7 +86,7 @@ pub fn main() !void {
 
     // Handle update mode — doesn't need database or src/dest
     if (config.mode.? == .update) {
-        _ = update.run(allocator, stderr, use_color) catch |err| switch (err) {
+        _ = update.run(allocator, io, stderr, use_color) catch |err| switch (err) {
             error.AlreadyUpToDate => return,
             else => std.process.exit(1),
         };
@@ -112,14 +108,7 @@ pub fn main() !void {
     }
 
     // Read database connection config from environment
-    var env = std.process.getEnvMap(allocator) catch |err| {
-        try stderr.print("Failed to read environment: {}\n", .{err});
-        try stderr.flush();
-        std.process.exit(1);
-    };
-    defer env.deinit();
-
-    const db_url = env.get("DATABASE_URL") orelse loadDotEnvValue(allocator, ".env", "DATABASE_URL") orelse {
+    const db_url = init.environ_map.get("DATABASE_URL") orelse loadDotEnvValue(allocator, io, ".env", "DATABASE_URL") orelse {
         const e = lib.errors.Error{ .config = .{
             .message = "DATABASE_URL is required. Set it as an environment variable or in a .env file.\n  Example: DATABASE_URL=postgresql://user:password@localhost:5432/mydb",
         } };
@@ -138,7 +127,7 @@ pub fn main() !void {
     // Resolve src_dir to absolute path
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const src_dir: []const u8 = blk: {
-        const abs = std.fs.cwd().realpath(config.src_dir.?, &path_buf) catch {
+        const len = std.Io.Dir.cwd().realPathFile(io, config.src_dir.?, &path_buf) catch {
             const e = lib.errors.Error{ .config = .{
                 .message = "Could not resolve --src directory path.",
             } };
@@ -146,19 +135,19 @@ pub fn main() !void {
             try stderr.flush();
             std.process.exit(1);
         };
-        break :blk try allocator.dupe(u8, abs);
+        break :blk try allocator.dupe(u8, path_buf[0..len]);
     };
     defer allocator.free(src_dir);
 
     // In generate mode, clean dest_dir to remove stale files
     if (config.mode.? == .generate) {
-        std.fs.cwd().deleteTree(config.dest_dir.?) catch {};
+        std.Io.Dir.cwd().deleteTree(io, config.dest_dir.?) catch {};
     }
 
     // Resolve dest_dir to absolute path, creating it if needed
     var dest_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const dest_dir: []const u8 = blk: {
-        std.fs.cwd().makePath(config.dest_dir.?) catch {
+        std.Io.Dir.cwd().createDirPath(io, config.dest_dir.?) catch {
             const e = lib.errors.Error{ .config = .{
                 .message = "Could not create --dest directory.",
             } };
@@ -166,7 +155,7 @@ pub fn main() !void {
             try stderr.flush();
             std.process.exit(1);
         };
-        const abs = std.fs.cwd().realpath(config.dest_dir.?, &dest_path_buf) catch {
+        const len = std.Io.Dir.cwd().realPathFile(io, config.dest_dir.?, &dest_path_buf) catch {
             const e = lib.errors.Error{ .config = .{
                 .message = "Could not resolve --dest directory path.",
             } };
@@ -174,7 +163,7 @@ pub fn main() !void {
             try stderr.flush();
             std.process.exit(1);
         };
-        break :blk try allocator.dupe(u8, abs);
+        break :blk try allocator.dupe(u8, dest_path_buf[0..len]);
     };
     defer allocator.free(dest_dir);
 
@@ -184,7 +173,7 @@ pub fn main() !void {
     if (use_color) try stderr.writeAll("\x1b[0m");
     try stderr.flush();
 
-    var groups = lib.project.discoverSqlFiles(allocator, src_dir, dest_dir, true) catch {
+    var groups = lib.project.discoverSqlFiles(allocator, io, src_dir, dest_dir, true) catch {
         const e = lib.errors.Error{ .file = .{
             .path = src_dir,
             .message = "Failed to scan for SQL files.",
@@ -218,6 +207,7 @@ pub fn main() !void {
 
     var conn = lib.connection.Connection.connect(
         allocator,
+        io,
         config.host,
         config.port,
         config.user,
@@ -271,7 +261,7 @@ pub fn main() !void {
         defer untyped_queries.deinit(allocator);
 
         for (group.sql_files.items) |sql_file| {
-            const uqs = lib.query.parseFile(allocator, sql_file) catch |err| {
+            const uqs = lib.query.parseFile(allocator, io, sql_file) catch |err| {
                 const e = lib.errors.Error{ .query_error = .{
                     .file_path = sql_file,
                     .message = @errorName(err),
@@ -387,7 +377,7 @@ pub fn main() !void {
 
         switch (config.mode.?) {
             .generate => {
-                std.fs.cwd().makePath(group.parent_dir) catch {
+                std.Io.Dir.cwd().createDirPath(io, group.parent_dir) catch {
                     const e2 = lib.errors.Error{ .file = .{
                         .path = group.parent_dir,
                         .message = "Cannot create output directory.",
@@ -398,7 +388,7 @@ pub fn main() !void {
                     continue;
                 };
 
-                var dir = std.fs.cwd().openDir(group.parent_dir, .{}) catch {
+                var dir = std.Io.Dir.cwd().openDir(io, group.parent_dir, .{}) catch {
                     const e2 = lib.errors.Error{ .file = .{
                         .path = group.parent_dir,
                         .message = "Cannot open output directory.",
@@ -408,9 +398,9 @@ pub fn main() !void {
                     error_count += 1;
                     continue;
                 };
-                defer dir.close();
+                defer dir.close(io);
 
-                const file = dir.createFile(output_filename, .{}) catch {
+                const file = dir.createFile(io, output_filename, .{}) catch {
                     const e2 = lib.errors.Error{ .file = .{
                         .path = group.output_path,
                         .message = "Cannot create output file.",
@@ -420,9 +410,9 @@ pub fn main() !void {
                     error_count += 1;
                     continue;
                 };
-                defer file.close();
+                defer file.close(io);
 
-                file.writeAll(generated) catch {
+                file.writeStreamingAll(io, generated) catch {
                     const e2 = lib.errors.Error{ .file = .{
                         .path = group.output_path,
                         .message = "Failed to write output file.",
@@ -437,21 +427,15 @@ pub fn main() !void {
                 try stderr.flush();
             },
             .verify => {
-                const existing = std.fs.cwd().openFile(group.output_path, .{}) catch {
+                const existing_content = std.Io.Dir.cwd().readFileAlloc(io, group.output_path, allocator, .unlimited) catch {
                     try stderr.print("  {s}: file does not exist (would be generated)\n", .{group.output_path});
                     try stderr.flush();
                     error_count += 1;
                     continue;
                 };
-                defer existing.close();
-
-                const existing_content = existing.readToEndAlloc(allocator, 10 * 1024 * 1024) catch {
-                    error_count += 1;
-                    continue;
-                };
                 defer allocator.free(existing_content);
 
-                const formatted = zigFmt(allocator, generated);
+                const formatted = zigFmt(allocator, io, generated);
                 defer if (formatted.ptr != generated.ptr) allocator.free(formatted);
 
                 if (!std.mem.eql(u8, existing_content, formatted)) {
@@ -471,8 +455,8 @@ pub fn main() !void {
     if (successful_group_indices.items.len > 0) {
         if (helper_content) |hc| {
             switch (config.mode.?) {
-                .generate => try writeOutputFile(allocator, dest_dir, "helper.zig", hc, stderr, use_color, &error_count),
-                .verify => try checkOutputFile(allocator, dest_dir, "helper.zig", hc, stderr, use_color, &error_count),
+                .generate => try writeOutputFile(allocator, io, dest_dir, "helper.zig", hc, stderr, use_color, &error_count),
+                .verify => try checkOutputFile(allocator, io, dest_dir, "helper.zig", hc, stderr, use_color, &error_count),
                 .update => unreachable,
             }
         }
@@ -497,20 +481,20 @@ pub fn main() !void {
         defer allocator.free(root_content);
 
         switch (config.mode.?) {
-            .generate => try writeOutputFile(allocator, dest_dir, "root.zig", root_content, stderr, use_color, &error_count),
-            .verify => try checkOutputFile(allocator, dest_dir, "root.zig", root_content, stderr, use_color, &error_count),
+            .generate => try writeOutputFile(allocator, io, dest_dir, "root.zig", root_content, stderr, use_color, &error_count),
+            .verify => try checkOutputFile(allocator, io, dest_dir, "root.zig", root_content, stderr, use_color, &error_count),
             .update => unreachable,
         }
 
         // Format all generated files with zig fmt
         if (config.mode.? == .generate) {
-            if (std.process.Child.run(.{
-                .allocator = allocator,
+            const fmt_result = std.process.run(allocator, io, .{
                 .argv = &.{ "zig", "fmt", dest_dir },
-            })) |fmt_result| {
-                allocator.free(fmt_result.stdout);
-                allocator.free(fmt_result.stderr);
-            } else |_| {}
+            }) catch null;
+            if (fmt_result) |r| {
+                allocator.free(r.stdout);
+                allocator.free(r.stderr);
+            }
         }
     }
 
@@ -536,6 +520,7 @@ pub fn main() !void {
 
 fn writeOutputFile(
     allocator: std.mem.Allocator,
+    io: std.Io,
     base_dir: []const u8,
     filename: []const u8,
     content: []const u8,
@@ -546,25 +531,25 @@ fn writeOutputFile(
     const output_path = try std.fs.path.join(allocator, &.{ base_dir, filename });
     defer allocator.free(output_path);
 
-    var dir = std.fs.openDirAbsolute(base_dir, .{}) catch {
+    var dir = std.Io.Dir.openDirAbsolute(io, base_dir, .{}) catch {
         const e = lib.errors.Error{ .file = .{ .path = base_dir, .message = "Cannot open output directory." } };
         try e.format(stderr, use_color);
         try stderr.flush();
         error_count.* += 1;
         return;
     };
-    defer dir.close();
+    defer dir.close(io);
 
-    const file = dir.createFile(filename, .{}) catch {
+    const file = dir.createFile(io, filename, .{}) catch {
         const e = lib.errors.Error{ .file = .{ .path = output_path, .message = "Cannot create output file." } };
         try e.format(stderr, use_color);
         try stderr.flush();
         error_count.* += 1;
         return;
     };
-    defer file.close();
+    defer file.close(io);
 
-    file.writeAll(content) catch {
+    file.writeStreamingAll(io, content) catch {
         const e = lib.errors.Error{ .file = .{ .path = output_path, .message = "Failed to write output file." } };
         try e.format(stderr, use_color);
         try stderr.flush();
@@ -578,6 +563,7 @@ fn writeOutputFile(
 
 fn checkOutputFile(
     allocator: std.mem.Allocator,
+    io: std.Io,
     base_dir: []const u8,
     filename: []const u8,
     content: []const u8,
@@ -588,21 +574,15 @@ fn checkOutputFile(
     const output_path = try std.fs.path.join(allocator, &.{ base_dir, filename });
     defer allocator.free(output_path);
 
-    const existing = std.fs.cwd().openFile(output_path, .{}) catch {
+    const existing_content = std.Io.Dir.cwd().readFileAlloc(io, output_path, allocator, .unlimited) catch {
         try stderr.print("  {s}: file does not exist (would be generated)\n", .{output_path});
         try stderr.flush();
         error_count.* += 1;
         return;
     };
-    defer existing.close();
-
-    const existing_content = existing.readToEndAlloc(allocator, 10 * 1024 * 1024) catch {
-        error_count.* += 1;
-        return;
-    };
     defer allocator.free(existing_content);
 
-    const formatted = zigFmt(allocator, content);
+    const formatted = zigFmt(allocator, io, content);
     defer if (formatted.ptr != content.ptr) allocator.free(formatted);
 
     if (!std.mem.eql(u8, existing_content, formatted)) {
@@ -617,50 +597,47 @@ fn checkOutputFile(
 
 /// Format Zig source code via `zig fmt --stdin`. Returns formatted content
 /// or the original content if zig fmt is unavailable.
-/// Format Zig source code via `zig fmt --stdin`. Returns formatted content
-/// or the original content if zig fmt is unavailable.
-fn zigFmt(allocator: std.mem.Allocator, source: []const u8) []const u8 {
-    var child = std.process.Child.init(
-        &.{ "zig", "fmt", "--stdin" },
-        allocator,
-    );
-    child.stdin_behavior = .Pipe;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-
-    child.spawn() catch return source;
+fn zigFmt(allocator: std.mem.Allocator, io: std.Io, source: []const u8) []const u8 {
+    var child = std.process.spawn(io, .{
+        .argv = &.{ "zig", "fmt", "--stdin" },
+        .stdin = .pipe,
+        .stdout = .pipe,
+        .stderr = .ignore,
+    }) catch return source;
 
     // Write source to stdin and close it so zig fmt processes the input
     if (child.stdin) |stdin| {
-        stdin.writeAll(source) catch {};
-        stdin.close();
+        stdin.writeStreamingAll(io, source) catch {};
+        stdin.close(io);
         child.stdin = null;
     }
 
-    // Collect stdout and stderr
-    var stdout_buf: std.ArrayList(u8) = .empty;
-    var stderr_buf: std.ArrayList(u8) = .empty;
-    defer stderr_buf.deinit(allocator);
-
-    child.collectOutput(allocator, &stdout_buf, &stderr_buf, 10 * 1024 * 1024) catch {
-        stdout_buf.deinit(allocator);
-        _ = child.wait() catch {};
-        return source;
-    };
-
-    const term = child.wait() catch {
-        stdout_buf.deinit(allocator);
-        return source;
-    };
-
-    if (term.Exited == 0 and stdout_buf.items.len > 0) {
-        return allocator.dupe(u8, stdout_buf.items) catch {
-            stdout_buf.deinit(allocator);
+    // Read stdout
+    var out_buf = std.Io.Writer.Allocating.init(allocator);
+    if (child.stdout) |stdout_file| {
+        var read_buf: [8192]u8 = undefined;
+        var reader = stdout_file.reader(io, &read_buf);
+        _ = reader.interface.streamRemaining(&out_buf.writer) catch {
+            out_buf.deinit();
+            child.kill(io);
             return source;
         };
     }
 
-    stdout_buf.deinit(allocator);
+    const term = child.wait(io) catch {
+        out_buf.deinit();
+        return source;
+    };
+
+    var arr = out_buf.toArrayList();
+    if (term == .exited and term.exited == 0 and arr.items.len > 0) {
+        return allocator.dupe(u8, arr.items) catch {
+            arr.deinit(allocator);
+            return source;
+        };
+    }
+
+    arr.deinit(allocator);
     return source;
 }
 
@@ -710,16 +687,13 @@ fn parseDatabaseUrl(config: *Config, url: []const u8) !void {
 }
 
 /// Load a single value from a .env file. Returns null if file or key not found.
-fn loadDotEnvValue(allocator: std.mem.Allocator, path: []const u8, key: []const u8) ?[]const u8 {
-    const file = std.fs.cwd().openFile(path, .{}) catch return null;
-    defer file.close();
-
-    const content = file.readToEndAlloc(allocator, 64 * 1024) catch return null;
+fn loadDotEnvValue(allocator: std.mem.Allocator, io: std.Io, path: []const u8, key: []const u8) ?[]const u8 {
+    const content = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(64 * 1024)) catch return null;
     defer allocator.free(content);
 
     var lines = std.mem.splitScalar(u8, content, '\n');
     while (lines.next()) |raw_line| {
-        const line = std.mem.trimRight(u8, raw_line, "\r");
+        const line = std.mem.trimEnd(u8, raw_line, "\r");
         const trimmed = std.mem.trim(u8, line, " \t");
         if (trimmed.len == 0 or trimmed[0] == '#') continue;
 
@@ -794,6 +768,7 @@ test "parse DATABASE_URL without port" {
 
 test "loadDotEnvValue" {
     const allocator = std.testing.allocator;
+    const test_io = std.testing.io;
 
     // Write a temp .env file
     var tmp_dir = std.testing.tmpDir(.{});
@@ -806,24 +781,17 @@ test "loadDotEnvValue" {
         \\EMPTY=
         \\
     ;
-    tmp_dir.dir.writeFile(.{ .sub_path = ".env", .data = env_content }) catch unreachable;
+    tmp_dir.dir.writeFile(test_io, .{ .sub_path = ".env", .data = env_content }) catch unreachable;
 
-    // Get the real path for the .env file
-    const env_path = tmp_dir.dir.realpathAlloc(allocator, ".env") catch unreachable;
-    defer allocator.free(env_path);
-
-    // We can't easily test loadDotEnvValue directly since it uses cwd,
-    // but we can test the parsing logic by reading and parsing manually.
-    const file = tmp_dir.dir.openFile(".env", .{}) catch unreachable;
-    defer file.close();
-    const content = file.readToEndAlloc(allocator, 64 * 1024) catch unreachable;
+    // Read and parse the file manually to test the parsing logic
+    const content = tmp_dir.dir.readFileAlloc(test_io, ".env", allocator, .unlimited) catch unreachable;
     defer allocator.free(content);
 
     // Verify the content parses correctly by checking line-by-line
     var found_url = false;
     var lines = std.mem.splitScalar(u8, content, '\n');
     while (lines.next()) |raw_line| {
-        const line = std.mem.trimRight(u8, raw_line, "\r");
+        const line = std.mem.trimEnd(u8, raw_line, "\r");
         const trimmed = std.mem.trim(u8, line, " \t");
         if (trimmed.len == 0 or trimmed[0] == '#') continue;
         const eq_pos = std.mem.indexOfScalar(u8, trimmed, '=') orelse continue;

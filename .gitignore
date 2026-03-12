@@ -2,4 +2,5 @@
 .claude
 .env
 zig-out
+zig-pkg
 src/example/dest

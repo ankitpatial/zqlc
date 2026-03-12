@@ -16,9 +16,9 @@ pub const ScramState = struct {
 };
 
 /// Generate the client-first message for SCRAM-SHA-256.
-pub fn clientFirst(allocator: std.mem.Allocator, user: []const u8) !struct { state: ScramState, message: []const u8 } {
+pub fn clientFirst(allocator: std.mem.Allocator, io: std.Io, user: []const u8) !struct { state: ScramState, message: []const u8 } {
     var nonce_bytes: [18]u8 = undefined;
-    std.crypto.random.bytes(&nonce_bytes);
+    io.random(&nonce_bytes);
 
     var nonce: [24]u8 = undefined;
     _ = std.base64.standard.Encoder.encode(&nonce, &nonce_bytes);

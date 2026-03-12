@@ -375,7 +375,7 @@ fn emitSqlLiteral(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), sql: []
         if (!first) try buf.append(allocator, '\n');
         first = false;
         try buf.appendSlice(allocator, "\\\\");
-        const clean = std.mem.trimRight(u8, line, "\r");
+        const clean = std.mem.trimEnd(u8, line, "\r");
         if (clean.len > 0) {
             try buf.append(allocator, ' ');
             try buf.appendSlice(allocator, clean);
@@ -505,7 +505,9 @@ fn scanTypeNeeds(
 
 /// Append formatted text to an ArrayList(u8).
 fn appendFmt(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), comptime fmt: []const u8, args: anytype) !void {
-    try buf.writer(allocator).print(fmt, args);
+    const s = try std.fmt.allocPrint(allocator, fmt, args);
+    defer allocator.free(s);
+    try buf.appendSlice(allocator, s);
 }
 
 /// Convert a query name to a PascalCase struct name with suffix.
@@ -1165,49 +1167,40 @@ test "generate nullable vs non-nullable columns" {
 
 test "fuzz snakeToPascal" {
     try std.testing.fuzz({}, struct {
-        fn run(_: void, input: []const u8) anyerror!void {
+        fn run(_: void, smith: *std.testing.Smith) anyerror!void {
             const allocator = std.testing.allocator;
-            // Only test with valid ASCII identifiers
-            for (input) |c| {
-                if (!std.ascii.isAlphanumeric(c) and c != '_') return;
-            }
-            if (input.len == 0) return;
+            var buf: [64]u8 = undefined;
+            const weights: []const std.testing.Smith.Weight = &.{
+                .rangeAtMost(u8, 'a', 'z', 3),
+                .value(u8, '_', 2),
+                .rangeAtMost(u8, 'A', 'Z', 1),
+            };
+            const len = smith.sliceWeightedBytes(&buf, weights);
+            if (len == 0) return;
+            const input = buf[0..len];
             const result = try snakeToPascal(allocator, input);
             defer allocator.free(result);
-            // Result should never be longer than input
             if (result.len > input.len) return error.OutputTooLong;
         }
-    }.run, .{
-        .corpus = &.{
-            "find_user_by_id",
-            "get_all",
-            "user",
-            "__double__under__",
-            "a",
-            "ABC",
-        },
-    });
+    }.run, .{});
 }
 
 test "fuzz snakeToCamel" {
     try std.testing.fuzz({}, struct {
-        fn run(_: void, input: []const u8) anyerror!void {
+        fn run(_: void, smith: *std.testing.Smith) anyerror!void {
             const allocator = std.testing.allocator;
-            for (input) |c| {
-                if (!std.ascii.isAlphanumeric(c) and c != '_') return;
-            }
-            if (input.len == 0) return;
+            var buf: [64]u8 = undefined;
+            const weights: []const std.testing.Smith.Weight = &.{
+                .rangeAtMost(u8, 'a', 'z', 3),
+                .value(u8, '_', 2),
+                .rangeAtMost(u8, 'A', 'Z', 1),
+            };
+            const len = smith.sliceWeightedBytes(&buf, weights);
+            if (len == 0) return;
+            const input = buf[0..len];
             const result = try snakeToCamel(allocator, input);
             defer allocator.free(result);
             if (result.len > input.len) return error.OutputTooLong;
         }
-    }.run, .{
-        .corpus = &.{
-            "find_user_by_id",
-            "list_users",
-            "user",
-            "_field",
-            "x",
-        },
-    });
+    }.run, .{});
 }

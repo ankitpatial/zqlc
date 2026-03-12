@@ -72,8 +72,8 @@ pub fn parseSqlcAnnotation(line: []const u8) ?SqlcAnnotation {
 /// Parse a .sql file into one or more UntypedQuery values.
 /// Files with multiple `-- name:` annotations are split into separate queries.
 /// Files without annotations fall back to single-query parsing using the filename.
-pub fn parseFile(allocator: std.mem.Allocator, file_path: []const u8) ![]UntypedQuery {
-    const content = try std.fs.cwd().readFileAlloc(allocator, file_path, 10 * 1024 * 1024);
+pub fn parseFile(allocator: std.mem.Allocator, io: std.Io, file_path: []const u8) ![]UntypedQuery {
+    const content = try std.Io.Dir.cwd().readFileAlloc(io, file_path, allocator, .limited(10 * 1024 * 1024));
     defer allocator.free(content);
 
     return parseContent(allocator, content, file_path);
@@ -193,7 +193,7 @@ fn flushBlock(
     var sql_str = std.mem.trim(u8, sql_buf.items, " \t\r\n");
     // Strip trailing semicolons
     while (sql_str.len > 0 and sql_str[sql_str.len - 1] == ';') {
-        sql_str = std.mem.trimRight(u8, sql_str[0 .. sql_str.len - 1], " \t\r\n");
+        sql_str = std.mem.trimEnd(u8, sql_str[0 .. sql_str.len - 1], " \t\r\n");
     }
     if (sql_str.len == 0) return; // skip empty blocks
 
@@ -247,7 +247,7 @@ fn parseSingleQuery(allocator: std.mem.Allocator, content: []const u8, file_path
     var sql = std.mem.trim(u8, content[sql_start..], " \t\r\n");
     // Strip trailing semicolons
     while (sql.len > 0 and sql[sql.len - 1] == ';') {
-        sql = std.mem.trimRight(u8, sql[0 .. sql.len - 1], " \t\r\n");
+        sql = std.mem.trimEnd(u8, sql[0 .. sql.len - 1], " \t\r\n");
     }
     if (sql.len == 0) return error.EmptyQuery;
 
@@ -674,37 +674,32 @@ test "validateIdentifier invalid names rejected" {
 
 test "fuzz parseSqlcAnnotation" {
     try std.testing.fuzz({}, struct {
-        fn run(_: void, input: []const u8) anyerror!void {
-            // parseSqlcAnnotation should never crash — just return null or valid annotation
+        fn run(_: void, smith: *std.testing.Smith) anyerror!void {
+            var buf: [128]u8 = undefined;
+            const len = smith.sliceWeightedBytes(&buf, &.{
+                .rangeAtMost(u8, 0x20, 0x7e, 1),
+            });
+            const input = buf[0..len];
             const result = parseSqlcAnnotation(input);
             if (result) |ann| {
-                // Invariant: name and kind must be valid
                 if (ann.name.len == 0) return error.EmptyName;
-                _ = ann.kind; // must be a valid enum value
+                _ = ann.kind;
             }
         }
-    }.run, .{
-        .corpus = &.{
-            "name: GetUser :one",
-            "name: ListUsers :many",
-            "name: DeleteUser :exec",
-            "name: UpdateUser :execrows",
-            "name:",
-            "name: :one",
-            "",
-            "not an annotation",
-            "name: A :one :many",
-            "name: A:B :one",
-        },
-    });
+    }.run, .{});
 }
 
 test "fuzz parseContent" {
     try std.testing.fuzz({}, struct {
-        fn run(_: void, input: []const u8) anyerror!void {
+        fn run(_: void, smith: *std.testing.Smith) anyerror!void {
             const allocator = std.testing.allocator;
+            var buf: [256]u8 = undefined;
+            const len = smith.sliceWeightedBytes(&buf, &.{
+                .rangeAtMost(u8, 0x20, 0x7e, 1),
+                .value(u8, '\n', 2),
+            });
+            const input = buf[0..len];
             const queries = parseContent(allocator, input, "fuzz/test.sql") catch |err| {
-                // These errors are expected for invalid input
                 switch (err) {
                     error.EmptyQuery => return,
                     error.OutOfMemory => return,
@@ -715,20 +710,10 @@ test "fuzz parseContent" {
                 for (queries) |q| freeUntypedQuery(allocator, q);
                 allocator.free(queries);
             }
-            // Invariant: each query must have non-empty name and sql
             for (queries) |q| {
                 if (q.name.len == 0) return error.EmptyName;
                 if (q.sql.len == 0) return error.EmptySql;
             }
         }
-    }.run, .{
-        .corpus = &.{
-            "-- name: Test :one\nSELECT 1;",
-            "-- name: A :one\nSELECT 1;\n\n-- name: B :exec\nDELETE FROM t;",
-            "SELECT * FROM users;",
-            "",
-            "-- just a comment",
-            "-- name: X :one\n-- name: Y :many\nSELECT 1;",
-        },
-    });
+    }.run, .{});
 }

@@ -1316,8 +1316,16 @@ test "extractParamNames zero params" {
 
 test "fuzz replaceNamedParams" {
     try std.testing.fuzz({}, struct {
-        fn run(_: void, input: []const u8) anyerror!void {
+        fn run(_: void, smith: *std.testing.Smith) anyerror!void {
             const allocator = std.testing.allocator;
+            var buf: [256]u8 = undefined;
+            const len = smith.sliceWeightedBytes(&buf, &.{
+                .rangeAtMost(u8, 0x20, 0x7e, 1),
+                .value(u8, '@', 2),
+                .rangeAtMost(u8, 'a', 'z', 3),
+                .value(u8, '_', 1),
+            });
+            const input = buf[0..len];
             const result = try replaceNamedParams(allocator, input);
             if (result) |r| {
                 defer {
@@ -1325,18 +1333,14 @@ test "fuzz replaceNamedParams" {
                     for (r.names) |n| allocator.free(n);
                     allocator.free(r.names);
                 }
-                // Invariant: output should never contain @name tokens outside
-                // comments and string literals
                 var idx: usize = 0;
                 while (idx < r.sql.len) {
-                    // Skip string literals
                     if (r.sql[idx] == '\'') {
                         idx += 1;
                         while (idx < r.sql.len and r.sql[idx] != '\'') : (idx += 1) {}
                         if (idx < r.sql.len) idx += 1;
                         continue;
                     }
-                    // Skip line comments
                     if (r.sql[idx] == '-' and idx + 1 < r.sql.len and r.sql[idx + 1] == '-') {
                         while (idx < r.sql.len and r.sql[idx] != '\n') : (idx += 1) {}
                         continue;
@@ -1348,32 +1352,26 @@ test "fuzz replaceNamedParams" {
                     }
                     idx += 1;
                 }
-                // Invariant: all names should be non-empty
                 for (r.names) |name| {
                     if (name.len == 0) return error.EmptyParamName;
                 }
             }
         }
-    }.run, .{
-        .corpus = &.{
-            "SELECT * FROM users WHERE id = @user_id",
-            "WHERE (@x::int IS NULL OR col = @x) AND @y = 1",
-            "SELECT '@not_a_param' FROM t WHERE a = @real_param",
-            "-- comment @ignored\nWHERE x = @val",
-            "",
-            "@",
-            "@@",
-            "@123",
-            "hello@world",
-        },
-    });
+    }.run, .{});
 }
 
 test "fuzz extractParamNames" {
     try std.testing.fuzz({}, struct {
-        fn run(_: void, input: []const u8) anyerror!void {
+        fn run(_: void, smith: *std.testing.Smith) anyerror!void {
             const allocator = std.testing.allocator;
-            // Count $N references in input to determine param_count
+            var buf: [256]u8 = undefined;
+            const len = smith.sliceWeightedBytes(&buf, &.{
+                .rangeAtMost(u8, 0x20, 0x7e, 1),
+                .value(u8, '$', 2),
+                .rangeAtMost(u8, '0', '9', 2),
+                .rangeAtMost(u8, 'a', 'z', 3),
+            });
+            const input = buf[0..len];
             var max_param: usize = 0;
             var i: usize = 0;
             while (i < input.len) : (i += 1) {
@@ -1384,29 +1382,16 @@ test "fuzz extractParamNames" {
                     if (num > max_param) max_param = num;
                 }
             }
-            if (max_param > 64) return; // skip unreasonably large param counts
+            if (max_param > 64) return;
             const names = try extractParamNames(allocator, input, max_param);
             defer {
                 for (names) |n| allocator.free(n);
                 allocator.free(names);
             }
-            // Invariant: should return exactly max_param names
             if (names.len != max_param) return error.WrongNameCount;
-            // Invariant: all names should be non-empty
             for (names) |name| {
                 if (name.len == 0) return error.EmptyName;
             }
         }
-    }.run, .{
-        .corpus = &.{
-            "SELECT * FROM users WHERE id = $1",
-            "INSERT INTO t (a, b) VALUES ($1, $2)",
-            "UPDATE t SET x = $1 WHERE id = $2",
-            "SELECT * FROM t LIMIT $1 OFFSET $2",
-            "WHERE a >= $1 AND b <= $2",
-            "",
-            "no params here",
-            "$1 $1 $1",
-        },
-    });
+    }.run, .{});
 }

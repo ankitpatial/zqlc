@@ -119,8 +119,9 @@ pub const ConfigError = struct {
 };
 
 /// Detect whether a file descriptor is a TTY.
-pub fn isTty(fd: std.posix.fd_t) bool {
-    return std.posix.isatty(fd);
+pub fn isTty(fd: std.Io.File, io: std.Io) bool {
+    // return std.posix.isatty(fd);
+    return std.Io.File.isTty(fd, io) catch false;
 }
 
 test "error formatting" {

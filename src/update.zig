@@ -2,14 +2,14 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 /// Single source of truth for the sqlz version.
-pub const version = "0.4.2";
+pub const version = "0.4.3";
 
 /// GitHub repository path.
 const repo = "ankitpatial/sqlz";
 
 pub const UpdateError = error{
     UnsupportedPlatform,
-    CurlFailed,
+    FetchFailed,
     VersionParseFailed,
     DownloadFailed,
     ExtractionFailed,
@@ -110,32 +110,30 @@ test "buildDownloadUrl with different tags" {
     try std.testing.expect(std.mem.indexOf(u8, url2, "/v0.1.0-beta/") != null);
 }
 
-/// Shells out to curl to fetch the latest release tag from GitHub.
+/// Fetches the latest release tag from GitHub using std.http.Client.
 /// Returns the tag name string (e.g. "v0.2.0"). Caller owns the returned memory.
-pub fn fetchLatestTag(allocator: std.mem.Allocator) ![]const u8 {
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &.{
-            "curl",
-            "-sfL",
-            "-H",
-            "Accept: application/vnd.github.v3+json",
-            "https://api.github.com/repos/" ++ repo ++ "/releases/latest",
-        },
-    }) catch {
-        return error.CurlFailed;
-    };
-    defer allocator.free(result.stderr);
-    defer allocator.free(result.stdout);
+pub fn fetchLatestTag(allocator: std.mem.Allocator, io: std.Io) ![]const u8 {
+    var client: std.http.Client = .{ .allocator = allocator, .io = io };
+    defer client.deinit();
 
-    switch (result.term) {
-        .Exited => |code| {
-            if (code != 0) return error.CurlFailed;
-        },
-        else => return error.CurlFailed,
-    }
+    var response_buf = std.Io.Writer.Allocating.init(allocator);
+    defer response_buf.deinit();
 
-    return parseTagName(allocator, result.stdout);
+    const result = client.fetch(.{
+        .location = .{ .url = "https://api.github.com/repos/" ++ repo ++ "/releases/latest" },
+        .extra_headers = &.{
+            .{ .name = "Accept", .value = "application/vnd.github.v3+json" },
+            .{ .name = "User-Agent", .value = "sqlz/" ++ version },
+        },
+        .response_writer = &response_buf.writer,
+    }) catch return error.FetchFailed;
+
+    if (result.status != .ok) return error.FetchFailed;
+
+    var body = response_buf.toArrayList();
+    defer body.deinit(allocator);
+
+    return parseTagName(allocator, body.items);
 }
 
 /// Extracts the "tag_name" value from a GitHub API JSON response
@@ -181,7 +179,7 @@ fn parseTagName(allocator: std.mem.Allocator, json: []const u8) ![]const u8 {
 /// Main entrypoint for self-update. Checks for a newer release on GitHub,
 /// downloads the matching binary, and replaces the current executable.
 /// Returns the new version tag (caller-owned) on success.
-pub fn run(allocator: std.mem.Allocator, stderr: *std.Io.Writer, use_color: bool) ![]const u8 {
+pub fn run(allocator: std.mem.Allocator, io: std.Io, stderr: *std.Io.Writer, use_color: bool) ![]const u8 {
     // 1. Print "Checking for updates..."
     if (use_color) try stderr.writeAll("\x1b[36m");
     try stderr.writeAll("Checking for updates...\n");
@@ -189,10 +187,10 @@ pub fn run(allocator: std.mem.Allocator, stderr: *std.Io.Writer, use_color: bool
     try stderr.flush();
 
     // 2. Fetch the latest release tag from GitHub
-    const latest_tag = fetchLatestTag(allocator) catch |err| {
-        if (err == error.CurlFailed) {
+    const latest_tag = fetchLatestTag(allocator, io) catch |err| {
+        if (err == error.FetchFailed) {
             if (use_color) try stderr.writeAll("\x1b[31m");
-            try stderr.writeAll("Failed to check for updates. Please ensure curl is installed and you have internet access.\n");
+            try stderr.writeAll("Failed to check for updates. Please check your internet connection.\n");
             if (use_color) try stderr.writeAll("\x1b[0m");
             try stderr.flush();
         }
@@ -220,7 +218,7 @@ pub fn run(allocator: std.mem.Allocator, stderr: *std.Io.Writer, use_color: bool
     const download_url = try buildDownloadUrl(allocator, latest_tag);
     defer allocator.free(download_url);
 
-    try downloadAndReplace(allocator, download_url, stderr, use_color);
+    try downloadAndReplace(allocator, io, download_url, stderr, use_color);
 
     // 7. Print success
     if (use_color) try stderr.writeAll("\x1b[32m");
@@ -234,31 +232,45 @@ pub fn run(allocator: std.mem.Allocator, stderr: *std.Io.Writer, use_color: bool
 
 /// Downloads the release archive from `url`, extracts the binary, and replaces
 /// the current executable in-place.
-fn downloadAndReplace(allocator: std.mem.Allocator, url: []const u8, stderr: *std.Io.Writer, use_color: bool) !void {
+fn downloadAndReplace(allocator: std.mem.Allocator, io: std.Io, url: []const u8, stderr: *std.Io.Writer, use_color: bool) !void {
     const is_windows = builtin.os.tag == .windows;
     const archive_path = if (is_windows) "C:\\Temp\\sqlz-update.zip" else "/tmp/sqlz-update.tar.gz";
     const extracted_binary = if (is_windows) "C:\\Temp\\sqlz.exe" else "/tmp/sqlz";
 
-    // 1. Download the archive
+    // 1. Download the archive using std.http.Client
     if (use_color) try stderr.writeAll("\x1b[36m");
     try stderr.writeAll("Downloading...\n");
     if (use_color) try stderr.writeAll("\x1b[0m");
     try stderr.flush();
 
-    const dl_result = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &.{ "curl", "-sfL", "-o", archive_path, url },
-    }) catch {
-        return error.DownloadFailed;
-    };
-    defer allocator.free(dl_result.stderr);
-    defer allocator.free(dl_result.stdout);
+    {
+        var client: std.http.Client = .{ .allocator = allocator, .io = io };
+        defer client.deinit();
 
-    switch (dl_result.term) {
-        .Exited => |code| {
-            if (code != 0) return error.DownloadFailed;
-        },
-        else => return error.DownloadFailed,
+        var response_buf = std.Io.Writer.Allocating.init(allocator);
+        defer response_buf.deinit();
+
+        const result = client.fetch(.{
+            .location = .{ .url = url },
+            .extra_headers = &.{
+                .{ .name = "User-Agent", .value = "sqlz/" ++ version },
+            },
+            .response_writer = &response_buf.writer,
+        }) catch return error.DownloadFailed;
+
+        if (result.status != .ok) return error.DownloadFailed;
+
+        var body = response_buf.toArrayList();
+        defer body.deinit(allocator);
+
+        // Write downloaded archive to temp file
+        const file = std.Io.Dir.createFileAbsolute(io, archive_path, .{}) catch return error.DownloadFailed;
+        defer file.close(io);
+
+        var write_buf: [8192]u8 = undefined;
+        var w = file.writer(io, &write_buf);
+        w.interface.writeAll(body.items) catch return error.DownloadFailed;
+        w.interface.flush() catch return error.DownloadFailed;
     }
 
     // 2. Extract the binary from the archive
@@ -267,84 +279,72 @@ fn downloadAndReplace(allocator: std.mem.Allocator, url: []const u8, stderr: *st
     if (use_color) try stderr.writeAll("\x1b[0m");
     try stderr.flush();
 
-    if (is_windows) {
-        // Windows: use PowerShell to extract
-        const ps_cmd = "Expand-Archive -Force -Path 'C:\\Temp\\sqlz-update.zip' -DestinationPath 'C:\\Temp'";
-        const ext_result = std.process.Child.run(.{
-            .allocator = allocator,
-            .argv = &.{ "powershell", "-NoProfile", "-Command", ps_cmd },
-        }) catch {
-            return error.ExtractionFailed;
-        };
-        defer allocator.free(ext_result.stderr);
-        defer allocator.free(ext_result.stdout);
+    const ext_result = std.process.run(allocator, io, .{
+        .argv = if (is_windows)
+            &.{ "powershell", "-NoProfile", "-Command", "Expand-Archive -Force -Path 'C:\\Temp\\sqlz-update.zip' -DestinationPath 'C:\\Temp'" }
+        else
+            &.{ "tar", "-xzf", archive_path, "-C", "/tmp", "sqlz" },
+    }) catch return error.ExtractionFailed;
+    defer allocator.free(ext_result.stdout);
+    defer allocator.free(ext_result.stderr);
 
-        switch (ext_result.term) {
-            .Exited => |code| {
-                if (code != 0) return error.ExtractionFailed;
-            },
-            else => return error.ExtractionFailed,
-        }
-    } else {
-        // Unix: use tar to extract
-        const ext_result = std.process.Child.run(.{
-            .allocator = allocator,
-            .argv = &.{ "tar", "-xzf", archive_path, "-C", "/tmp", "sqlz" },
-        }) catch {
-            return error.ExtractionFailed;
-        };
-        defer allocator.free(ext_result.stderr);
-        defer allocator.free(ext_result.stdout);
-
-        switch (ext_result.term) {
-            .Exited => |code| {
-                if (code != 0) return error.ExtractionFailed;
-            },
-            else => return error.ExtractionFailed,
-        }
+    switch (ext_result.term) {
+        .exited => |code| {
+            if (code != 0) return error.ExtractionFailed;
+        },
+        else => return error.ExtractionFailed,
     }
 
     // 3. Get current executable path
     var exe_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const exe_path = std.fs.selfExePath(&exe_path_buf) catch {
+    const exe_len = std.process.executablePath(io, &exe_path_buf) catch {
         return error.ReplaceFailed;
     };
+    const exe_path = exe_path_buf[0..exe_len];
 
-    // 4. Read the new binary and write it over the current executable
-    const new_binary = blk: {
-        const file = std.fs.openFileAbsolute(extracted_binary, .{}) catch {
+    // 4. Read the new binary
+    const new_binary: []u8 = blk: {
+        const file = std.Io.Dir.openFileAbsolute(io, extracted_binary, .{}) catch {
             return error.ReplaceFailed;
         };
-        defer file.close();
-        break :blk file.readToEndAlloc(allocator, 100 * 1024 * 1024) catch {
+        defer file.close(io);
+
+        var read_buf: [8192]u8 = undefined;
+        var reader = file.reader(io, &read_buf);
+        var content = std.Io.Writer.Allocating.init(allocator);
+        errdefer content.deinit();
+
+        _ = reader.interface.streamRemaining(&content.writer) catch {
+            content.deinit();
             return error.ReplaceFailed;
         };
+
+        var arr = content.toArrayList();
+        break :blk arr.items;
     };
     defer allocator.free(new_binary);
 
-    // Write over the current executable
-    const exe_file = std.fs.openFileAbsolute(exe_path, .{ .mode = .write_only }) catch {
+    // 5. Write it over the current executable
+    const exe_file = std.Io.Dir.openFileAbsolute(io, exe_path, .{ .mode = .write_only }) catch {
         return error.ReplaceFailed;
     };
-    defer exe_file.close();
-    exe_file.writeAll(new_binary) catch {
-        return error.ReplaceFailed;
-    };
+    defer exe_file.close(io);
 
-    // 5. Set executable permissions on Unix
+    var exe_write_buf: [8192]u8 = undefined;
+    var exe_writer = exe_file.writer(io, &exe_write_buf);
+    exe_writer.interface.writeAll(new_binary) catch return error.ReplaceFailed;
+    exe_writer.interface.flush() catch return error.ReplaceFailed;
+
+    // 6. Set executable permissions on Unix
     if (!is_windows) {
-        const posix_file = std.fs.openFileAbsolute(exe_path, .{ .mode = .read_only }) catch {
-            return error.ReplaceFailed;
-        };
-        defer posix_file.close();
-        posix_file.chmod(0o755) catch {
+        exe_file.setPermissions(io, std.Io.File.Permissions.fromMode(0o755)) catch {
             return error.ReplaceFailed;
         };
     }
 
-    // 6. Clean up temp files
-    std.fs.deleteFileAbsolute(archive_path) catch {};
-    std.fs.deleteFileAbsolute(extracted_binary) catch {};
+    // 7. Clean up temp files
+    std.Io.Dir.deleteFileAbsolute(io, archive_path) catch {};
+    std.Io.Dir.deleteFileAbsolute(io, extracted_binary) catch {};
 }
 
 test "parseTagName extracts tag from normal JSON" {

@@ -17,22 +17,41 @@ pub const ErrorField = struct {
     value: []const u8,
 };
 
+// ─── Helpers ────────────────────────────────────────────────────────────────
+
+fn appendI32(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, value: i32) !void {
+    var bytes: [4]u8 = undefined;
+    std.mem.writeInt(i32, &bytes, value, .big);
+    try buf.appendSlice(allocator, &bytes);
+}
+
+fn appendU32(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, value: u32) !void {
+    var bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &bytes, value, .big);
+    try buf.appendSlice(allocator, &bytes);
+}
+
+fn appendI16(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, value: i16) !void {
+    var bytes: [2]u8 = undefined;
+    std.mem.writeInt(i16, &bytes, value, .big);
+    try buf.appendSlice(allocator, &bytes);
+}
+
 // ─── Frontend Messages ──────────────────────────────────────────────────────
 
 /// Encode a StartupMessage (no message type byte).
 pub fn encodeStartup(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), user: []const u8, database: []const u8) !void {
     buf.clearRetainingCapacity();
-    const w = buf.writer(allocator);
 
-    try w.writeInt(i32, 0, .big); // placeholder for length
-    try w.writeInt(i32, 196608, .big); // Protocol version 3.0
-    try w.writeAll("user\x00");
-    try w.writeAll(user);
-    try w.writeByte(0);
-    try w.writeAll("database\x00");
-    try w.writeAll(database);
-    try w.writeByte(0);
-    try w.writeByte(0); // terminator
+    try appendI32(buf, allocator, 0); // placeholder for length
+    try appendI32(buf, allocator, 196608); // Protocol version 3.0
+    try buf.appendSlice(allocator, "user\x00");
+    try buf.appendSlice(allocator, user);
+    try buf.append(allocator, 0);
+    try buf.appendSlice(allocator, "database\x00");
+    try buf.appendSlice(allocator, database);
+    try buf.append(allocator, 0);
+    try buf.append(allocator, 0); // terminator
 
     std.mem.writeInt(i32, buf.items[0..4], @intCast(buf.items.len), .big);
 }
@@ -40,109 +59,100 @@ pub fn encodeStartup(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), user
 /// Encode a PasswordMessage ('p').
 pub fn encodePassword(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), password: []const u8) !void {
     buf.clearRetainingCapacity();
-    const w = buf.writer(allocator);
 
-    try w.writeByte('p');
+    try buf.append(allocator, 'p');
     const len: i32 = @intCast(4 + password.len + 1);
-    try w.writeInt(i32, len, .big);
-    try w.writeAll(password);
-    try w.writeByte(0);
+    try appendI32(buf, allocator, len);
+    try buf.appendSlice(allocator, password);
+    try buf.append(allocator, 0);
 }
 
 /// Encode a SASLInitialResponse message ('p').
 pub fn encodeSaslInitial(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), mechanism: []const u8, client_first: []const u8) !void {
     buf.clearRetainingCapacity();
-    const w = buf.writer(allocator);
 
-    try w.writeByte('p');
+    try buf.append(allocator, 'p');
     const len: i32 = @intCast(4 + mechanism.len + 1 + 4 + client_first.len);
-    try w.writeInt(i32, len, .big);
-    try w.writeAll(mechanism);
-    try w.writeByte(0);
-    try w.writeInt(i32, @intCast(client_first.len), .big);
-    try w.writeAll(client_first);
+    try appendI32(buf, allocator, len);
+    try buf.appendSlice(allocator, mechanism);
+    try buf.append(allocator, 0);
+    try appendI32(buf, allocator, @intCast(client_first.len));
+    try buf.appendSlice(allocator, client_first);
 }
 
 /// Encode a SASLResponse message ('p').
 pub fn encodeSaslResponse(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), data: []const u8) !void {
     buf.clearRetainingCapacity();
-    const w = buf.writer(allocator);
 
-    try w.writeByte('p');
+    try buf.append(allocator, 'p');
     const len: i32 = @intCast(4 + data.len);
-    try w.writeInt(i32, len, .big);
-    try w.writeAll(data);
+    try appendI32(buf, allocator, len);
+    try buf.appendSlice(allocator, data);
 }
 
 /// Encode a Parse message.
 pub fn encodeParse(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), stmt_name: []const u8, query_sql: []const u8) !void {
     buf.clearRetainingCapacity();
-    const w = buf.writer(allocator);
 
-    try w.writeByte('P');
+    try buf.append(allocator, 'P');
     const len: i32 = @intCast(4 + stmt_name.len + 1 + query_sql.len + 1 + 2);
-    try w.writeInt(i32, len, .big);
-    try w.writeAll(stmt_name);
-    try w.writeByte(0);
-    try w.writeAll(query_sql);
-    try w.writeByte(0);
-    try w.writeInt(i16, 0, .big); // let server decide param types
+    try appendI32(buf, allocator, len);
+    try buf.appendSlice(allocator, stmt_name);
+    try buf.append(allocator, 0);
+    try buf.appendSlice(allocator, query_sql);
+    try buf.append(allocator, 0);
+    try appendI16(buf, allocator, 0); // let server decide param types
 }
 
 /// Encode a Describe message ('D').
 pub fn encodeDescribe(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), target: u8, name: []const u8) !void {
     buf.clearRetainingCapacity();
-    const w = buf.writer(allocator);
 
-    try w.writeByte('D');
+    try buf.append(allocator, 'D');
     const len: i32 = @intCast(4 + 1 + name.len + 1);
-    try w.writeInt(i32, len, .big);
-    try w.writeByte(target); // 'S' for statement, 'P' for portal
-    try w.writeAll(name);
-    try w.writeByte(0);
+    try appendI32(buf, allocator, len);
+    try buf.append(allocator, target); // 'S' for statement, 'P' for portal
+    try buf.appendSlice(allocator, name);
+    try buf.append(allocator, 0);
 }
 
 /// Encode a Sync message ('S').
 pub fn encodeSync(allocator: std.mem.Allocator, buf: *std.ArrayList(u8)) !void {
     buf.clearRetainingCapacity();
-    const w = buf.writer(allocator);
 
-    try w.writeByte('S');
-    try w.writeInt(i32, 4, .big);
+    try buf.append(allocator, 'S');
+    try appendI32(buf, allocator, 4);
 }
 
 /// Encode a Terminate message ('X').
 pub fn encodeTerminate(allocator: std.mem.Allocator, buf: *std.ArrayList(u8)) !void {
     buf.clearRetainingCapacity();
-    const w = buf.writer(allocator);
 
-    try w.writeByte('X');
-    try w.writeInt(i32, 4, .big);
+    try buf.append(allocator, 'X');
+    try appendI32(buf, allocator, 4);
 }
 
 /// Encode a simple Query message ('Q').
 pub fn encodeQuery(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), sql: []const u8) !void {
     buf.clearRetainingCapacity();
-    const w = buf.writer(allocator);
 
-    try w.writeByte('Q');
+    try buf.append(allocator, 'Q');
     const len: i32 = @intCast(4 + sql.len + 1);
-    try w.writeInt(i32, len, .big);
-    try w.writeAll(sql);
-    try w.writeByte(0);
+    try appendI32(buf, allocator, len);
+    try buf.appendSlice(allocator, sql);
+    try buf.append(allocator, 0);
 }
 
 /// Encode a Close statement message ('C').
 pub fn encodeClose(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), target: u8, name: []const u8) !void {
     buf.clearRetainingCapacity();
-    const w = buf.writer(allocator);
 
-    try w.writeByte('C');
+    try buf.append(allocator, 'C');
     const len: i32 = @intCast(4 + 1 + name.len + 1);
-    try w.writeInt(i32, len, .big);
-    try w.writeByte(target);
-    try w.writeAll(name);
-    try w.writeByte(0);
+    try appendI32(buf, allocator, len);
+    try buf.append(allocator, target);
+    try buf.appendSlice(allocator, name);
+    try buf.append(allocator, 0);
 }
 
 // ─── Backend Messages ───────────────────────────────────────────────────────
@@ -330,6 +340,16 @@ fn cstring(data: []const u8) []const u8 {
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
+fn buildBackendMsg(allocator: std.mem.Allocator, msg_type: u8, payload: []const u8) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    try buf.append(allocator, msg_type);
+    const len: i32 = @intCast(4 + payload.len);
+    try appendI32(&buf, allocator, len);
+    try buf.appendSlice(allocator, payload);
+    return buf.toOwnedSlice(allocator);
+}
+
 test "encode startup message" {
     const allocator = std.testing.allocator;
     var buf: std.ArrayList(u8) = .empty;
@@ -412,17 +432,6 @@ test "encode close message" {
 }
 
 // ─── Backend message decoding tests ──────────────────────────────────────
-
-fn buildBackendMsg(allocator: std.mem.Allocator, msg_type: u8, payload: []const u8) ![]u8 {
-    var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(allocator);
-    const w = buf.writer(allocator);
-    try w.writeByte(msg_type);
-    const len: i32 = @intCast(4 + payload.len);
-    try w.writeInt(i32, len, .big);
-    try w.writeAll(payload);
-    return buf.toOwnedSlice(allocator);
-}
 
 test "decode auth_ok" {
     const allocator = std.testing.allocator;
@@ -525,17 +534,16 @@ test "decode row_description" {
     // Build a RowDescription with 1 field: "id"
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
-    const w = buf.writer(allocator);
 
-    try w.writeInt(i16, 1, .big); // 1 field
-    try w.writeAll("id"); // field name
-    try w.writeByte(0); // null terminator
-    try w.writeInt(u32, 16384, .big); // table OID
-    try w.writeInt(i16, 1, .big); // column attr
-    try w.writeInt(u32, 23, .big); // type OID (int4)
-    try w.writeInt(i16, 4, .big); // type length
-    try w.writeInt(i32, -1, .big); // type mod
-    try w.writeInt(i16, 0, .big); // format code
+    try appendI16(&buf, allocator, 1); // 1 field
+    try buf.appendSlice(allocator, "id"); // field name
+    try buf.append(allocator, 0); // null terminator
+    try appendU32(&buf, allocator, 16384); // table OID
+    try appendI16(&buf, allocator, 1); // column attr
+    try appendU32(&buf, allocator, 23); // type OID (int4)
+    try appendI16(&buf, allocator, 4); // type length
+    try appendI32(&buf, allocator, -1); // type mod
+    try appendI16(&buf, allocator, 0); // format code
 
     const data = try buildBackendMsg(allocator, 'T', buf.items);
     defer allocator.free(data);
@@ -560,17 +568,16 @@ test "decode data_row" {
     const allocator = std.testing.allocator;
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
-    const w = buf.writer(allocator);
 
-    try w.writeInt(i16, 3, .big); // 3 columns
+    try appendI16(&buf, allocator, 3); // 3 columns
     // Column 1: "hello"
-    try w.writeInt(i32, 5, .big);
-    try w.writeAll("hello");
+    try appendI32(&buf, allocator, 5);
+    try buf.appendSlice(allocator, "hello");
     // Column 2: NULL
-    try w.writeInt(i32, -1, .big);
+    try appendI32(&buf, allocator, -1);
     // Column 3: "42"
-    try w.writeInt(i32, 2, .big);
-    try w.writeAll("42");
+    try appendI32(&buf, allocator, 2);
+    try buf.appendSlice(allocator, "42");
 
     const data = try buildBackendMsg(allocator, 'D', buf.items);
     defer allocator.free(data);

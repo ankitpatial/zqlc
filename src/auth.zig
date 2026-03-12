@@ -22,7 +22,7 @@ pub fn authenticate(
 
 fn handleCleartext(allocator: std.mem.Allocator, conn: *Connection, password: []const u8) !void {
     try protocol.encodePassword(allocator, &conn.send_buf, password);
-    try conn.stream.writeAll(conn.send_buf.items);
+    try conn.flushSendBuf();
 }
 
 fn handleMd5(allocator: std.mem.Allocator, conn: *Connection, user: []const u8, password: []const u8, salt: [4]u8) !void {
@@ -60,18 +60,18 @@ fn handleMd5(allocator: std.mem.Allocator, conn: *Connection, user: []const u8, 
     @memcpy(pw_buf[3..35], &outer_hex);
 
     try protocol.encodePassword(allocator, &conn.send_buf, &pw_buf);
-    try conn.stream.writeAll(conn.send_buf.items);
+    try conn.flushSendBuf();
 }
 
 fn handleScram(allocator: std.mem.Allocator, conn: *Connection, user: []const u8, password: []const u8) !void {
     // Step 1: Send SASLInitialResponse with client-first-message
-    const first = try scram.clientFirst(allocator, user);
+    const first = try scram.clientFirst(allocator, conn.io, user);
     var state = first.state;
     defer state.deinit();
     defer allocator.free(first.message);
 
     try protocol.encodeSaslInitial(allocator, &conn.send_buf, "SCRAM-SHA-256", first.message);
-    try conn.stream.writeAll(conn.send_buf.items);
+    try conn.flushSendBuf();
 
     // Step 2: Receive server-first-message
     const server_first_data = try conn.recvMsg();
@@ -83,7 +83,7 @@ fn handleScram(allocator: std.mem.Allocator, conn: *Connection, user: []const u8
             defer allocator.free(client_final);
 
             try protocol.encodeSaslResponse(allocator, &conn.send_buf, client_final);
-            try conn.stream.writeAll(conn.send_buf.items);
+            try conn.flushSendBuf();
 
             // Step 4: Receive server-final-message
             const server_final_data = try conn.recvMsg();

@@ -4,7 +4,8 @@ const auth = @import("auth.zig");
 
 pub const Connection = struct {
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    io: std.Io,
+    stream: std.Io.net.Stream,
     recv_buf: [16384]u8 = undefined,
     recv_len: usize = 0,
     recv_start: usize = 0,
@@ -13,26 +14,29 @@ pub const Connection = struct {
     /// Connect to a PostgreSQL server, authenticate, and wait for ReadyForQuery.
     pub fn connect(
         allocator: std.mem.Allocator,
+        io: std.Io,
         host: []const u8,
         port: u16,
         user: []const u8,
         password: []const u8,
         database: []const u8,
     ) !Connection {
-        const stream = std.net.tcpConnectToHost(allocator, host, port) catch {
+        const host_name: std.Io.net.HostName = .{ .bytes = host };
+        const stream = std.Io.net.HostName.connect(host_name, io, port, .{ .mode = .stream }) catch {
             return error.ConnectionRefused;
         };
-        errdefer stream.close();
+        errdefer stream.close(io);
 
         var self = Connection{
             .allocator = allocator,
+            .io = io,
             .stream = stream,
         };
         errdefer self.send_buf.deinit(allocator);
 
         // Send StartupMessage
         try protocol.encodeStartup(allocator, &self.send_buf, user, database);
-        try stream.writeAll(self.send_buf.items);
+        try self.flushSendBuf();
 
         // Read messages until ReadyForQuery
         while (true) {
@@ -52,34 +56,53 @@ pub const Connection = struct {
         }
     }
 
+    /// Write send_buf contents to the stream and flush.
+    pub fn flushSendBuf(self: *Connection) !void {
+        var write_buf: [8192]u8 = undefined;
+        var w = self.stream.writer(self.io, &write_buf);
+        w.interface.writeAll(self.send_buf.items) catch return error.ConnectionRefused;
+        w.interface.flush() catch return error.ConnectionRefused;
+    }
+
     /// Send a Parse message.
     pub fn sendParse(self: *Connection, stmt_name: []const u8, sql: []const u8) !void {
         try protocol.encodeParse(self.allocator, &self.send_buf, stmt_name, sql);
-        try self.stream.writeAll(self.send_buf.items);
+        try self.flushSendBuf();
     }
 
     /// Send a Describe message for a statement.
     pub fn sendDescribeStatement(self: *Connection, stmt_name: []const u8) !void {
         try protocol.encodeDescribe(self.allocator, &self.send_buf, 'S', stmt_name);
-        try self.stream.writeAll(self.send_buf.items);
+        try self.flushSendBuf();
     }
 
     /// Send a Sync message.
     pub fn sendSync(self: *Connection) !void {
         try protocol.encodeSync(self.allocator, &self.send_buf);
-        try self.stream.writeAll(self.send_buf.items);
+        try self.flushSendBuf();
     }
 
     /// Send a simple Query message.
     pub fn sendQuery(self: *Connection, sql: []const u8) !void {
         try protocol.encodeQuery(self.allocator, &self.send_buf, sql);
-        try self.stream.writeAll(self.send_buf.items);
+        try self.flushSendBuf();
     }
 
     /// Send a Close statement message.
     pub fn sendCloseStatement(self: *Connection, stmt_name: []const u8) !void {
         try protocol.encodeClose(self.allocator, &self.send_buf, 'S', stmt_name);
-        try self.stream.writeAll(self.send_buf.items);
+        try self.flushSendBuf();
+    }
+
+    /// Read bytes from the network into recv_buf.
+    fn readFromNetwork(self: *Connection) !usize {
+        var bufs: [1][]u8 = .{self.recv_buf[self.recv_len..]};
+        const n = self.io.vtable.netRead(self.io.userdata, self.stream.socket.handle, &bufs) catch {
+            return error.ConnectionClosed;
+        };
+        if (n == 0) return error.ConnectionClosed;
+        self.recv_len += n;
+        return n;
     }
 
     /// Receive the next backend message.
@@ -94,9 +117,7 @@ pub const Connection = struct {
                     error.NeedMoreData => {
                         // Compact before reading if no room at end
                         self.compactRecvBuf();
-                        const bytes_read = try self.stream.read(self.recv_buf[self.recv_len..]);
-                        if (bytes_read == 0) return error.ConnectionClosed;
-                        self.recv_len += bytes_read;
+                        _ = try self.readFromNetwork();
                         continue;
                     },
                     else => return err,
@@ -114,9 +135,7 @@ pub const Connection = struct {
 
             // Compact before reading if no room at end
             self.compactRecvBuf();
-            const bytes_read = try self.stream.read(self.recv_buf[self.recv_len..]);
-            if (bytes_read == 0) return error.ConnectionClosed;
-            self.recv_len += bytes_read;
+            _ = try self.readFromNetwork();
         }
     }
 
@@ -148,9 +167,9 @@ pub const Connection = struct {
     /// Send a Terminate message and close the connection.
     pub fn close(self: *Connection) void {
         protocol.encodeTerminate(self.allocator, &self.send_buf) catch {};
-        self.stream.writeAll(self.send_buf.items) catch {};
+        self.flushSendBuf() catch {};
         self.send_buf.deinit(self.allocator);
-        self.stream.close();
+        self.stream.close(self.io);
     }
 };
 
